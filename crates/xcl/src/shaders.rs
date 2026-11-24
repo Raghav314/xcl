@@ -983,6 +983,9 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
         let windows = runtime_windows();
         return precompile(&input, opts.limit, windows, opts.split, opts.only.as_deref(), opts.pipelines, used.as_ref(), t0);
     }
+    if args.iter().any(|a| a == "--time-forms") {
+        return time_forms(&input, args, t0);
+    }
     if opts.direct {
         return direct_sweep(&input, &opts, t0);
     }
@@ -2416,6 +2419,207 @@ fn direct_sweep(input: &Input, opts: &ShadersOptions, t0: std::time::Instant) ->
         print!("{}", rep.text(top));
         println!("time {:.1} s", t0.elapsed().as_secs_f64());
     }
+    0
+}
+
+/// `--time-forms [--windows W] [--heap] [--split 0|1] [--timeout S] [--limit N] [--threads T]
+/// [--warm] [--all N] [--max-hlsl MB] [--max-dxil KB] [--no-hlsl] [--dump DIR] [--out FILE]`: for each
+/// compute program the per-lane form translates, the same program in four forms, each made
+/// into a compute pipeline one at a time (no XCL cache, no concurrency): the per-lane form,
+/// #1426's per-instruction form, the HLSL path with W windows and the HLSL path with heap
+/// windows. Per form: translation time (+ DXC for HLSL), DXIL bytes and
+/// `CreateComputePipelineState` time. One CSV row per program, by index only (no names).
+/// The driver's own shader cache is turned off for the process (`ShaderCacheControl`, needs
+/// Windows developer mode; `--warm` keeps it). The first row includes the driver's warm-up.
+/// `--heap`: the two direct forms with heap windows instead of W. `--no-hlsl`: the HLSL
+/// columns stay empty. `--dump DIR`: each form's DXIL as `DIR/<idx>_<pl|pi|hl|hh>.dxil`.
+fn time_forms(input: &Input, args: &[String], t0: std::time::Instant) -> i32 {
+    use std::time::{Duration, Instant};
+    use windows::Win32::Graphics::Direct3D12::*;
+    let opt = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).and_then(|v| v.parse::<u64>().ok());
+    let windows = opt("--windows").unwrap_or(4) as u32;
+    let split = opt("--split").map(|v| v != 0).unwrap_or(true);
+    let timeout = Duration::from_secs(opt("--timeout").unwrap_or(120));
+    let limit = opt("--limit").map(|v| v as usize).unwrap_or(usize::MAX);
+    let out_path = args.iter().position(|a| a == "--out").and_then(|i| args.get(i + 1)).cloned();
+    let threads = opt("--threads").map(|v| v.max(1) as usize).unwrap_or(8);
+    // `--all N`: a size-spread sample of N compute programs of every size (the 10 largest
+    // always in), not only the ones the per-lane form takes (its columns are empty where it
+    // refuses one)
+    let all = opt("--all").map(|v| v as usize);
+    let heap = args.iter().any(|a| a == "--heap");
+    let no_hlsl = args.iter().any(|a| a == "--no-hlsl");
+    let dump_dir = args.iter().position(|a| a == "--dump").and_then(|i| args.get(i + 1)).map(std::path::PathBuf::from);
+    if let Some(d) = &dump_dir {
+        let _ = std::fs::create_dir_all(d);
+    }
+    let dump = |idx: usize, form: &str, dxil: &[u8]| {
+        if let Some(d) = &dump_dir {
+            let _ = std::fs::write(d.join(format!("{idx}_{form}.dxil")), dxil);
+        }
+    };
+    // caps for the giants: no DXC above `--max-hlsl` MB of HLSL, no driver build above
+    // `--max-dxil` KB of DXIL (sizes are still recorded)
+    let max_hlsl = opt("--max-hlsl").unwrap_or(16) as usize * (1 << 20);
+    let max_dxil = opt("--max-dxil").unwrap_or(4096) as usize * 1024;
+    std::panic::set_hook(Box::new(|_| {}));
+
+    // phase 1 (parallel): the compute programs and whether the per-lane form takes them
+    struct Prog {
+        idx: usize,
+        blob: Vec<u8>,
+        code: Vec<u8>,
+        cs: recomp::CsInterface,
+        o: crate::gpu::dxil::kernel::KernelOptions,
+    }
+    let run_timed = |f: Box<dyn FnOnce() -> Result<crate::gpu::dxil::kernel::Kernel, String> + Send>| -> (Result<crate::gpu::dxil::kernel::Kernel, String>, Duration) {
+        let t = Instant::now();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_else(|_| Err("panic".into())));
+        });
+        let r = rx.recv_timeout(timeout).unwrap_or_else(|_| Err("timeout".into()));
+        (r, t.elapsed())
+    };
+    let next = AtomicUsize::new(0);
+    let tried = AtomicUsize::new(0);
+    let covered: Mutex<Vec<Prog>> = Mutex::new(Vec::new());
+    std::thread::scope(|s| {
+        for _ in 0..threads {
+            s.spawn(|| loop {
+                let ri = next.fetch_add(1, Ordering::Relaxed);
+                if ri >= input.len() {
+                    break;
+                }
+                let (_, Some(blob)) = input.get(ri) else { continue };
+                let Some(sh) = xbox::parse(&blob) else { continue };
+                let Some(f) = sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == 6)) else { continue };
+                let Some(recomp::Mode::Compute(cs)) = recomp::interface(&blob, &sh, f) else { continue };
+                let Some(p) = f.programs.first() else { continue };
+                let code = f.data[p.offset..p.offset + p.len].to_vec();
+                tried.fetch_add(1, Ordering::Relaxed);
+                let wave64 = recomp::detect_wave64(&code);
+                let mem_windows = if heap { windows | recomp::HEAP_WINDOWS } else { windows };
+                let o = crate::gpu::dxil::kernel::KernelOptions { wave64, split: wave64 && split, mem_windows, sampler_base: 0 };
+                if all.is_some() {
+                    covered.lock().unwrap().push(Prog { idx: ri, blob, code, cs, o });
+                    continue;
+                }
+                let (c2, cs2) = (code.clone(), cs.clone());
+                let (r, _) = run_timed(Box::new(move || recomp::lower_dxil::compute_with(&c2, &cs2, o)));
+                if r.is_ok() {
+                    covered.lock().unwrap().push(Prog { idx: ri, blob, code, cs, o });
+                }
+            });
+        }
+    });
+    let mut progs = covered.into_inner().unwrap();
+    if let Some(n) = all {
+        // evenly spaced over the programs ranked by size, plus the 10 largest
+        progs.sort_by_key(|p| (p.code.len(), p.idx));
+        let len = progs.len();
+        let mut keep: std::collections::BTreeSet<usize> = (0..n.min(len)).map(|i| i * len / n.max(1)).collect();
+        keep.extend(len.saturating_sub(10)..len);
+        progs = progs.into_iter().enumerate().filter(|(i, _)| keep.contains(i)).map(|(_, p)| p).collect();
+        eprintln!("time-forms: --all: {} of {len} compute programs, by size", progs.len());
+    }
+    progs.sort_by_key(|p| p.idx);
+    if all.is_none() {
+        eprintln!("time-forms: per-lane form takes {} of {} compute programs ({:.0} s)", progs.len(), tried.load(Ordering::Relaxed), t0.elapsed().as_secs_f64());
+    }
+    eprintln!("time-forms: timing {} programs one at a time", progs.len().min(limit));
+    progs.truncate(limit);
+
+    // phase 2 (serial): every form of every covered program, translated then made
+    let pipelines = match Pipelines::new() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("time-forms: no D3D12 device: {e}");
+            return 1;
+        }
+    };
+    // cold driver builds: the driver's own shader cache off for this process (developer mode)
+    if args.iter().all(|a| a != "--warm") {
+        use windows::core::Interface;
+        let r = pipelines.dev.cast::<ID3D12Device9>().and_then(|d9| unsafe {
+            d9.ShaderCacheControl(D3D12_SHADER_CACHE_KIND_FLAG_IMPLICIT_DRIVER_MANAGED, D3D12_SHADER_CACHE_CONTROL_FLAG_DISABLE)
+        });
+        match r {
+            Ok(()) => eprintln!("time-forms: the driver's shader cache is off for this process"),
+            Err(e) => {
+                eprintln!("time-forms: cannot turn the driver's shader cache off ({e}); needs Windows developer mode, or pass --warm");
+                return 1;
+            }
+        }
+    }
+    let make = |dxil: &[u8], samplers: &[recomp::pso::StaticSampler]| -> Option<f64> {
+        let rs = recomp::pso::abi_root_signature_with(&pipelines.dev, true, samplers).ok()?;
+        let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            pRootSignature: std::mem::ManuallyDrop::new(Some(rs)),
+            CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr() as *const _, BytecodeLength: dxil.len() },
+            ..Default::default()
+        };
+        let t = Instant::now();
+        let r = unsafe { pipelines.dev.CreateComputePipelineState::<ID3D12PipelineState>(&desc) };
+        let ms = t.elapsed().as_secs_f64() * 1000.0;
+        drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
+        r.ok().map(|_| ms)
+    };
+    let fmt = |v: Option<f64>| v.map_or(String::new(), |v| format!("{v:.1}"));
+    let mut csv = String::from("idx,wave64,code_bytes,pl_tr_ms,pl_dxil,pl_pso_ms,pi_tr_ms,pi_dxil,pi_pso_ms,hl_tr_ms,hl_src,hl_dxc_ms,hl_dxil,hl_pso_ms,hh_tr_ms,hh_src,hh_dxc_ms,hh_dxil,hh_pso_ms\n");
+    for (n, p) in progs.iter().enumerate() {
+        let mut row = vec![p.idx.to_string(), (p.o.wave64 as u8).to_string(), p.code.len().to_string()];
+        // per-lane and per-instruction forms
+        for per_lane in [true, false] {
+            let (c, cs, o) = (p.code.clone(), p.cs.clone(), p.o);
+            let (r, tr) = run_timed(Box::new(move || if per_lane { recomp::lower_dxil::compute_with(&c, &cs, o) } else { crate::gpu::dxil::kernel::translate_compute(&c, o, &cs) }));
+            if let Ok(k) = &r {
+                dump(p.idx, if per_lane { "pl" } else { "pi" }, &k.dxil);
+            }
+            match r {
+                Ok(k) => row.extend([fmt(Some(tr.as_secs_f64() * 1000.0)), k.dxil.len().to_string(), fmt((k.dxil.len() <= max_dxil).then(|| make(&k.dxil, &k.static_samplers)).flatten())]),
+                Err(_) => row.extend([String::new(), String::new(), String::new()]),
+            }
+        }
+        // the HLSL path: W windows, then heap windows
+        for w in [windows, windows | recomp::HEAP_WINDOWS] {
+            if no_hlsl {
+                row.extend(std::iter::repeat_n(String::new(), 5));
+                continue;
+            }
+            let t = Instant::now();
+            let tr = recomp::pso::console_translation_compute(&p.blob, w, p.o.split);
+            let tr_ms = t.elapsed().as_secs_f64() * 1000.0;
+            match tr {
+                Ok((t_, _)) if t_.hlsl.len() > max_hlsl => row.extend([fmt(Some(tr_ms)), t_.hlsl.len().to_string(), String::new(), String::new(), String::new()]),
+                Ok((t_, profile)) => {
+                    let t = Instant::now();
+                    let d = recomp::dxc::compile(&t_.hlsl, "main", profile, &[]);
+                    let dxc_ms = t.elapsed().as_secs_f64() * 1000.0;
+                    if let Ok(d) = &d {
+                        dump(p.idx, if w & recomp::HEAP_WINDOWS != 0 { "hh" } else { "hl" }, d);
+                    }
+                    match d {
+                        Ok(d) => row.extend([fmt(Some(tr_ms)), t_.hlsl.len().to_string(), fmt(Some(dxc_ms)), d.len().to_string(), fmt((d.len() <= max_dxil).then(|| make(&d, &t_.static_samplers)).flatten())]),
+                        Err(_) => row.extend([fmt(Some(tr_ms)), t_.hlsl.len().to_string(), fmt(Some(dxc_ms)), String::new(), String::new()]),
+                    }
+                }
+                Err(_) => row.extend(std::iter::repeat_n(String::new(), 5)),
+            }
+        }
+        csv.push_str(&row.join(","));
+        csv.push('\n');
+        if let Some(path) = &out_path {
+            let _ = std::fs::write(path, &csv);
+        }
+        if all.is_some() || (n + 1) % 10 == 0 {
+            eprintln!("  {} / {} ({:.0} s)", n + 1, progs.len(), t0.elapsed().as_secs_f64());
+        }
+    }
+    if out_path.is_none() {
+        print!("{csv}");
+    }
+    eprintln!("time-forms: done, {} programs, {:.0} s", progs.len(), t0.elapsed().as_secs_f64());
     0
 }
 
