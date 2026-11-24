@@ -2430,8 +2430,10 @@ fn direct_sweep(input: &Input, opts: &ShadersOptions, t0: std::time::Instant) ->
 /// windows. Per form: translation time (+ DXC for HLSL), DXIL bytes and
 /// `CreateComputePipelineState` time. One CSV row per program, by record index and record hash
 /// (`shader::fnv64` of the record, as runtime logs name it; no names). Translations and pipeline
-/// builds run on threads of their own (256 MB stack) under `--timeout`: a cell that ran out of
-/// time reads `timeout` and the sweep goes on (the stuck build keeps its thread).
+/// builds run on threads of their own (256 MB stack) under `--timeout`: a cell with no result
+/// in that time reads `timeout` and the sweep goes on. That is a build still running (it keeps
+/// its thread) or one whose thread died without unwinding: under Wine, dxil-spirv's endless
+/// recursion on some programs overflows even the 256 MB stack (#1805).
 /// The driver's own shader cache is turned off for the process (`ShaderCacheControl`, needs
 /// Windows developer mode; vkd3d-proton does not implement it); `--warm` keeps it. The first
 /// row includes the driver's warm-up.
