@@ -659,6 +659,12 @@ fn direct_graphics(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32) -
     Ok(Compiled { dxil: k.dxil, samplers: k.static_samplers })
 }
 
+/// The HLSL path's translation of a console compute shader, without DXC (`xcl shaders
+/// --time-forms` times translation and DXC apart).
+pub fn console_translation_compute(blob: &[u8], windows: u32, split_wave64: bool) -> Result<(super::Translation, &'static str), String> {
+    console_translation(blob, Stage::Compute, 0, windows, split_wave64)
+}
+
 fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split_wave64: bool) -> Result<(super::Translation, &'static str), String> {
     if let Some(f) = fspx(blob) {
         if stage != Stage::Compute {
