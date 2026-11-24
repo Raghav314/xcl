@@ -2428,13 +2428,19 @@ fn direct_sweep(input: &Input, opts: &ShadersOptions, t0: std::time::Instant) ->
 /// into a compute pipeline one at a time (no XCL cache, no concurrency): the per-lane form,
 /// #1426's per-instruction form, the HLSL path with W windows and the HLSL path with heap
 /// windows. Per form: translation time (+ DXC for HLSL), DXIL bytes and
-/// `CreateComputePipelineState` time. One CSV row per program, by index only (no names).
+/// `CreateComputePipelineState` time. One CSV row per program, by record index and record hash
+/// (`shader::fnv64` of the record, as runtime logs name it; no names). Translations and pipeline
+/// builds run on threads of their own (256 MB stack) under `--timeout`: a cell that ran out of
+/// time reads `timeout` and the sweep goes on (the stuck build keeps its thread).
 /// The driver's own shader cache is turned off for the process (`ShaderCacheControl`, needs
-/// Windows developer mode; `--warm` keeps it). The first row includes the driver's warm-up.
+/// Windows developer mode; vkd3d-proton does not implement it); `--warm` keeps it. The first
+/// row includes the driver's warm-up.
 /// `--heap`: the two direct forms with heap windows instead of W. `--no-hlsl`: the HLSL
 /// columns stay empty. `--dump DIR`: each form's DXIL as `DIR/<idx>_<pl|pi|hl|hh>.dxil`.
 fn time_forms(input: &Input, args: &[String], t0: std::time::Instant) -> i32 {
     use std::time::{Duration, Instant};
+    // driver compilers recurse deeply on big programs (a 2 MB stack overflowed under Wine)
+    const BIG_STACK: usize = 256 << 20;
     use windows::Win32::Graphics::Direct3D12::*;
     let opt = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).and_then(|v| v.parse::<u64>().ok());
     let windows = opt("--windows").unwrap_or(4) as u32;
@@ -2475,9 +2481,12 @@ fn time_forms(input: &Input, args: &[String], t0: std::time::Instant) -> i32 {
     let run_timed = |f: Box<dyn FnOnce() -> Result<crate::gpu::dxil::kernel::Kernel, String> + Send>| -> (Result<crate::gpu::dxil::kernel::Kernel, String>, Duration) {
         let t = Instant::now();
         let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
+        let spawned = std::thread::Builder::new().stack_size(BIG_STACK).spawn(move || {
             let _ = tx.send(std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_else(|_| Err("panic".into())));
         });
+        if let Err(e) = spawned {
+            return (Err(format!("no thread: {e}")), t.elapsed());
+        }
         let r = rx.recv_timeout(timeout).unwrap_or_else(|_| Err("timeout".into()));
         (r, t.elapsed())
     };
@@ -2547,28 +2556,48 @@ fn time_forms(input: &Input, args: &[String], t0: std::time::Instant) -> i32 {
         match r {
             Ok(()) => eprintln!("time-forms: the driver's shader cache is off for this process"),
             Err(e) => {
-                eprintln!("time-forms: cannot turn the driver's shader cache off ({e}); needs Windows developer mode, or pass --warm");
+                eprintln!("time-forms: cannot turn the driver's shader cache off ({e}): it needs Windows developer mode, and vkd3d-proton does not implement it; pass --warm to time with the driver's cache as it is (turn it off yourself for cold builds)");
                 return 1;
             }
         }
     }
-    let make = |dxil: &[u8], samplers: &[recomp::pso::StaticSampler]| -> Option<f64> {
-        let rs = recomp::pso::abi_root_signature_with(&pipelines.dev, true, samplers).ok()?;
-        let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
-            pRootSignature: std::mem::ManuallyDrop::new(Some(rs)),
-            CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr() as *const _, BytecodeLength: dxil.len() },
-            ..Default::default()
-        };
-        let t = Instant::now();
-        let r = unsafe { pipelines.dev.CreateComputePipelineState::<ID3D12PipelineState>(&desc) };
-        let ms = t.elapsed().as_secs_f64() * 1000.0;
-        drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
-        r.ok().map(|_| ms)
-    };
     let fmt = |v: Option<f64>| v.map_or(String::new(), |v| format!("{v:.1}"));
-    let mut csv = String::from("idx,wave64,code_bytes,pl_tr_ms,pl_dxil,pl_pso_ms,pi_tr_ms,pi_dxil,pi_pso_ms,hl_tr_ms,hl_src,hl_dxc_ms,hl_dxil,hl_pso_ms,hh_tr_ms,hh_src,hh_dxc_ms,hh_dxil,hh_pso_ms\n");
+    // a pipeline build on a thread of its own under `--timeout`: its ms, "" if refused, "timeout"
+    struct Dev(ID3D12Device);
+    // SAFETY: ID3D12Device is free-threaded
+    unsafe impl Send for Dev {}
+    let make = |dxil: &[u8], samplers: &[recomp::pso::StaticSampler]| -> String {
+        let (dev, dxil, samplers) = (Dev(pipelines.dev.clone()), dxil.to_vec(), samplers.to_vec());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new().stack_size(BIG_STACK).spawn(move || {
+            let dev = dev;
+            let built = (|| {
+                let rs = recomp::pso::abi_root_signature_with(&dev.0, true, &samplers).ok()?;
+                let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::ManuallyDrop::new(Some(rs)),
+                    CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr() as *const _, BytecodeLength: dxil.len() },
+                    ..Default::default()
+                };
+                let t = Instant::now();
+                let r = unsafe { dev.0.CreateComputePipelineState::<ID3D12PipelineState>(&desc) };
+                let ms = t.elapsed().as_secs_f64() * 1000.0;
+                drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
+                r.ok().map(|_| ms)
+            })();
+            let _ = tx.send(built);
+        });
+        if spawned.is_err() {
+            return String::new();
+        }
+        match rx.recv_timeout(timeout) {
+            Ok(ms) => fmt(ms),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => "timeout".into(),
+            Err(_) => String::new(),
+        }
+    };
+    let mut csv = String::from("idx,hash,wave64,code_bytes,pl_tr_ms,pl_dxil,pl_pso_ms,pi_tr_ms,pi_dxil,pi_pso_ms,hl_tr_ms,hl_src,hl_dxc_ms,hl_dxil,hl_pso_ms,hh_tr_ms,hh_src,hh_dxc_ms,hh_dxil,hh_pso_ms\n");
     for (n, p) in progs.iter().enumerate() {
-        let mut row = vec![p.idx.to_string(), (p.o.wave64 as u8).to_string(), p.code.len().to_string()];
+        let mut row = vec![p.idx.to_string(), format!("{:016x}", shader::fnv64(&p.blob)), (p.o.wave64 as u8).to_string(), p.code.len().to_string()];
         // per-lane and per-instruction forms
         for per_lane in [true, false] {
             let (c, cs, o) = (p.code.clone(), p.cs.clone(), p.o);
@@ -2577,7 +2606,7 @@ fn time_forms(input: &Input, args: &[String], t0: std::time::Instant) -> i32 {
                 dump(p.idx, if per_lane { "pl" } else { "pi" }, &k.dxil);
             }
             match r {
-                Ok(k) => row.extend([fmt(Some(tr.as_secs_f64() * 1000.0)), k.dxil.len().to_string(), fmt((k.dxil.len() <= max_dxil).then(|| make(&k.dxil, &k.static_samplers)).flatten())]),
+                Ok(k) => row.extend([fmt(Some(tr.as_secs_f64() * 1000.0)), k.dxil.len().to_string(), if k.dxil.len() <= max_dxil { make(&k.dxil, &k.static_samplers) } else { String::new() }]),
                 Err(_) => row.extend([String::new(), String::new(), String::new()]),
             }
         }
@@ -2600,7 +2629,7 @@ fn time_forms(input: &Input, args: &[String], t0: std::time::Instant) -> i32 {
                         dump(p.idx, if w & recomp::HEAP_WINDOWS != 0 { "hh" } else { "hl" }, d);
                     }
                     match d {
-                        Ok(d) => row.extend([fmt(Some(tr_ms)), t_.hlsl.len().to_string(), fmt(Some(dxc_ms)), d.len().to_string(), fmt((d.len() <= max_dxil).then(|| make(&d, &t_.static_samplers)).flatten())]),
+                        Ok(d) => row.extend([fmt(Some(tr_ms)), t_.hlsl.len().to_string(), fmt(Some(dxc_ms)), d.len().to_string(), if d.len() <= max_dxil { make(&d, &t_.static_samplers) } else { String::new() }]),
                         Err(_) => row.extend([fmt(Some(tr_ms)), t_.hlsl.len().to_string(), fmt(Some(dxc_ms)), String::new(), String::new()]),
                     }
                 }
