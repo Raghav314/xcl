@@ -592,7 +592,7 @@ impl Lw {
             lw.waves = t.div_ceil(64).max(1);
         }
         if split && std::env::var_os("XCL_X64_ALL_MASKS").is_none() {
-            lw.whole_live = crate::gpu::recomp::x64_masks::by_pc(insts, kernel);
+            lw.whole_live = crate::gpu::recomp::x64_masks::by_pc_split(insts, kernel);
         }
         lw.setup_storage(uses_lds, if split { slot } else { 1 });
         if let (Some(t), true) = (group_threads, split) {

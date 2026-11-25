@@ -915,7 +915,8 @@ impl Lw {
             && (self.local_masks
                 || self.s.m.const_u64(cond) == Some(0)
                 || match *dst {
-                    Dst::S(n) => n < 126 && self.whole_live.get(&self.pc).is_some_and(|live| live & (3u128 << n) == 0),
+                    // EXEC (126) too: `x64_masks::by_pc_split` keeps it whole where it is read whole
+                    Dst::S(n) => n <= 126 && self.whole_live.get(&self.pc).is_some_and(|live| live & (3u128 << n) == 0),
                     Dst::Null => true,
                     Dst::V(_) => false,
                 });
