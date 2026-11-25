@@ -50,6 +50,9 @@ pub(super) struct Em {
     /// instruction (`x64_masks`); a mask written to none of them is only read lane by lane
     /// (split: stays in its half, no exchange; pixel: no quad reads for the helper lanes)
     pub mask_whole_live: BTreeMap<u64, u128>,
+    /// split wave64: pc of the 64-bit bitwise ops that exchange their result once, for the
+    /// compares they combine (`x64_masks::analyze_split`)
+    pub x64_sync: BTreeSet<u64>,
     /// wave64 VS / PS on a GPU with 32-lane waves only: what the console's lanes 32..63 hold
     /// where the program reads them (`upper_lanes`), used when the wave has 32 lanes
     pub upper: Option<super::upper_lanes::UpperLanes>,
@@ -614,6 +617,7 @@ impl Em {
             uses_scratch: false,
             x64_words: 1,
             mask_whole_live: BTreeMap::new(),
+            x64_sync: BTreeSet::new(),
             upper: None,
             cur_pc: 0,
             static_ss: BTreeMap::new(),
@@ -1883,6 +1887,10 @@ impl Em {
             }
         };
         self.line(&format!("uint {t0} = {lo}; uint {t1} = {hi};"));
+        if self.x64() && self.x64_sync.contains(&self.cur_pc) {
+            let x = self.t();
+            self.line(&format!("uint2 {x} = xcl_x_sync_mask({t0}, {t1}); {t0} = {x}.x; {t1} = {x}.y;"));
+        }
         if let Some(c) = scc {
             self.line(&format!("scc = (uint)({c});"));
         }
@@ -6127,6 +6135,15 @@ uint2 xcl_x_ballot(bool b) {
     uint m = WaveActiveBallot(b).x;
     xcl_x_put(0u, m);
     uint o = xcl_x_meet() ? xcl_x_get(0u) : 0u;
+    return xcl_half != 0u ? uint2(o, m) : uint2(m, o);
+}
+// a mask each half holds only its own word of (`x64_masks::analyze_split`): both words, from
+// both halves. With no other half, the word computed here for it is already right (its compare
+// bits are 0, and a tree op such as s_nor_b64 may still set them).
+uint2 xcl_x_sync_mask(uint lo, uint hi) {
+    uint m = select(xcl_half != 0u, hi, lo);
+    xcl_x_put(0u, m);
+    uint o = xcl_x_meet() ? xcl_x_get(0u) : select(xcl_half != 0u, lo, hi);
     return xcl_half != 0u ? uint2(o, m) : uint2(m, o);
 }
 // v_readlane / v_readfirstlane: the same lane index in both halves; the owner half's value

@@ -250,6 +250,9 @@ pub struct Lw {
     pub gfx_half: Option<Value>,
     /// split form: SGPRs whole-live after each instruction (`recomp::x64_masks::by_pc`)
     pub whole_live: std::collections::BTreeMap<u64, u128>,
+    /// split form: pc of the 64-bit bitwise ops that exchange their result once, for the
+    /// compares they combine (`recomp::x64_masks::analyze_split`, `Lw::sync_mask`)
+    pub x64_sync: std::collections::BTreeSet<u64>,
     /// set when an exchange was needed where it is not supported
     pub exchange_error: Option<String>,
     pub pc: u64,
@@ -1778,6 +1781,9 @@ impl Lw {
                 }
             }
         };
+        // split form: the last op of a mask tree whose compares stayed in their halves
+        // exchanges its result once, before `scc` is derived from it (`x64_masks::analyze_split`)
+        let (lo, hi) = if self.split && !self.local_masks && !one_word && self.x64_sync.contains(&self.pc) { self.sync_mask(lo, hi) } else { (lo, hi) };
         if nz {
             let c = if one_word {
                 self.nz(lo)

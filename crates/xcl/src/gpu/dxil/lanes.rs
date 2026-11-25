@@ -521,6 +521,22 @@ impl Lw {
         self.ballot_ps_quad(q)
     }
 
+    /// Split form: a mask (lo, hi) each half holds only its own word of (`x64_masks::analyze_split`)
+    /// → both words, from both halves (the HLSL `xcl_x_sync_mask`). With no other half the word
+    /// computed here for it is kept: its compare bits are 0, and a tree op such as `s_nor_b64`
+    /// may still set them. A second word (1) tells an exchange that met a partner from one that
+    /// gave 0 for want of one (a missing or dead partner in the spin form).
+    pub fn sync_mask(&mut self, lo: Value, hi: Value) -> (Value, Value) {
+        let u = self.upper;
+        let mine = self.sel(u, hi, lo);
+        let here = self.sel(u, lo, hi);
+        let one = self.c(1);
+        let got = self.exchange_n(&[mine, one]);
+        let met = self.nz(got[1]);
+        let o = self.sel(met, got[0], here);
+        (self.sel(u, o, mine), self.sel(u, mine, o))
+    }
+
     /// The hardware lane of console lane `l` (`l + 32 · xcl_half` for a wave32 program in
     /// 64-lane hardware).
     fn hw_lane(&mut self, l: Value) -> Value {

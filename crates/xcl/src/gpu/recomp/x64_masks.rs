@@ -32,7 +32,7 @@
 //! (`LOOP_GUARD`) is checked: what is live after a loop, or at the end, is live before each of
 //! its instructions.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;
 
 use super::emit::ext_encoding;
@@ -826,12 +826,9 @@ struct Block {
     has_exit: bool,
 }
 
-fn whole_live_out_unsorted(insts: &[Decoded], end_reads_all: bool, exec_local: bool, table: &UsePlanTable) -> Vec<Regs> {
-    let pcs: BTreeMap<u64, usize> = insts.iter().enumerate().map(|(i, d)| (d.pc, i)).collect();
-    let always = if exec_local { 0 } else { EXEC };
-    let at_end = if end_reads_all { ALL } else { always };
-    let scc_at_end = end_reads_all;
-    let succ: Vec<Option<Vec<usize>>> = insts
+/// Per instruction: the instructions it goes on to (None: unknown, an indirect jump).
+fn successors(insts: &[Decoded], pcs: &BTreeMap<u64, usize>) -> Vec<Option<Vec<usize>>> {
+    insts
         .iter()
         .enumerate()
         .map(|(i, d)| {
@@ -853,7 +850,15 @@ fn whole_live_out_unsorted(insts: &[Decoded], end_reads_all: bool, exec_local: b
             }
             Some(out)
         })
-        .collect();
+        .collect()
+}
+
+fn whole_live_out_unsorted(insts: &[Decoded], end_reads_all: bool, exec_local: bool, table: &UsePlanTable) -> (Vec<Regs>, Vec<bool>) {
+    let pcs: BTreeMap<u64, usize> = insts.iter().enumerate().map(|(i, d)| (d.pc, i)).collect();
+    let always = if exec_local { 0 } else { EXEC };
+    let at_end = if end_reads_all { ALL } else { always };
+    let scc_at_end = end_reads_all;
+    let succ = successors(insts, &pcs);
     let loops = super::loop_ranges(insts);
     let exits: Vec<Vec<Option<usize>>> = insts
         .iter()
@@ -888,7 +893,7 @@ fn whole_live_out_unsorted(insts: &[Decoded], end_reads_all: bool, exec_local: b
             }
         }
         if !changed {
-            return live_out;
+            return (live_out, scc_out);
         }
     }
 }
@@ -953,20 +958,21 @@ fn nested_loop_ranges(mut raw: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
 /// For each instruction (index in `insts`): the SGPRs whose whole value may be read after it.
 /// `end_reads_all`: the program's end reads every SGPR (kernel mode).
 pub fn whole_live_out(insts: &[Decoded], end_reads_all: bool) -> Vec<Regs> {
-    whole_live_out_mode(insts, end_reads_all, false)
+    whole_live_out_mode(insts, end_reads_all, false).0
 }
 
 /// `whole_live_out` for the split wave64 form: EXEC is whole-live only where the program
 /// reads it whole (`flows_of`), so a `v_cmpx` / saveexec whose EXEC is only read lane by lane
 /// needs no exchange. Pixel shaders keep EXEC whole: they read the quad's other lanes' bits.
 pub fn whole_live_out_split(insts: &[Decoded], end_reads_all: bool) -> Vec<Regs> {
-    whole_live_out_mode(insts, end_reads_all, true)
+    whole_live_out_mode(insts, end_reads_all, true).0
 }
 
-fn whole_live_out_mode(insts: &[Decoded], end_reads_all: bool, exec_local: bool) -> Vec<Regs> {
+/// Per instruction: the SGPRs whole-live after it, and whether `scc` is live after it.
+fn whole_live_out_mode(insts: &[Decoded], end_reads_all: bool, exec_local: bool) -> (Vec<Regs>, Vec<bool>) {
     let n = insts.len();
     if n == 0 {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
     let table = use_plans();
     if !insts.windows(2).all(|w| w[0].pc < w[1].pc) {
@@ -1206,6 +1212,7 @@ fn whole_live_out_mode(insts: &[Decoded], end_reads_all: bool, exec_local: bool)
 
     // Reconstruct per-instruction live_out in a single linear backward pass per block.
     let mut live_out = vec![0 as Regs; n];
+    let mut scc_out = vec![false; n];
     for b in 0..num_blocks {
         let blk = &blocks[b];
         let start = block_starts[b];
@@ -1225,13 +1232,14 @@ fn whole_live_out_mode(insts: &[Decoded], end_reads_all: bool, exec_local: bool)
         let (mut out, mut sout) = (block_out[b], block_sout[b]);
         for i in (start..end).rev() {
             live_out[i] = out;
+            scc_out[i] = sout;
             let f = &flows[i];
             let gen = gen_of(f, out, sout);
             out = gen | (out & !f.kill) | left | always;
             sout = f.reads_scc || (sout && !f.writes_scc) || sleft;
         }
     }
-    live_out
+    (live_out, scc_out)
 }
 
 /// pc → SGPRs whole-live after that instruction, for the emitter.
@@ -1242,6 +1250,169 @@ pub fn by_pc(insts: &[Decoded], end_reads_all: bool) -> BTreeMap<u64, Regs> {
 /// `by_pc` for the split wave64 form (`whole_live_out_split`).
 pub fn by_pc_split(insts: &[Decoded], end_reads_all: bool) -> BTreeMap<u64, Regs> {
     insts.iter().map(|d| d.pc).zip(whole_live_out_split(insts, end_reads_all)).collect()
+}
+
+/// What the split wave64 form's emitters need.
+pub struct Plan {
+    /// pc → SGPRs whole-live after that instruction (not the mask of a compare a tree exchanges)
+    pub whole_live: BTreeMap<u64, Regs>,
+    /// pc of the 64-bit bitwise ops that exchange their result once, for the compares they
+    /// combine (HLSL `xcl_x_sync_mask`, direct `Lw::sync_mask`)
+    pub sync: BTreeSet<u64>,
+}
+
+/// Compares and carries: their mask is written with `write_mask`, which can leave it local.
+fn mask_producer(name: &str) -> bool {
+    name.starts_with("V_CMP_") || matches!(name, "V_ADD_CO_U32" | "V_SUB_CO_U32" | "V_SUBREV_CO_U32" | "V_ADD_CO_CI_U32" | "V_SUB_CO_CI_U32" | "V_SUBREV_CO_CI_U32")
+}
+
+fn bits(mut m: Regs) -> impl Iterator<Item = usize> {
+    std::iter::from_fn(move || {
+        (m != 0).then(|| {
+            let r = m.trailing_zeros() as usize;
+            m &= m - 1;
+            r
+        })
+    })
+}
+
+/// The mask trees open in one basic block. A tree is named by its last instruction (a compare
+/// or a bitwise op) and is the register pair holding its value plus the compares it combines.
+struct Trees {
+    owner: [Option<usize>; 128],
+    open: BTreeMap<usize, (Regs, Vec<usize>)>,
+}
+
+impl Trees {
+    fn bind(&mut self, node: usize, pair: Regs, leaves: Vec<usize>) {
+        for r in bits(pair) {
+            self.owner[r] = Some(node);
+        }
+        self.open.insert(node, (pair, leaves));
+    }
+
+    fn take(&mut self, node: usize) -> Vec<usize> {
+        let Some((pair, leaves)) = self.open.remove(&node) else { return Vec::new() };
+        for r in bits(pair) {
+            if self.owner[r] == Some(node) {
+                self.owner[r] = None;
+            }
+        }
+        leaves
+    }
+
+    /// Ends the trees holding any of `regs`: read whole there (`whole`), or overwritten.
+    fn end(&mut self, regs: Regs, whole: bool, insts: &[Decoded], plan: &mut Plan, live_out: &mut [Regs]) {
+        for r in bits(regs) {
+            if let Some(node) = self.owner[r] {
+                let leaves = self.take(node);
+                if whole {
+                    exchange_at(node, leaves, insts, plan, live_out);
+                }
+            }
+        }
+    }
+
+    fn end_all(&mut self, insts: &[Decoded], plan: &mut Plan, live_out: &mut [Regs]) {
+        for (node, (_, leaves)) in std::mem::take(&mut self.open) {
+            exchange_at(node, leaves, insts, plan, live_out);
+        }
+        self.owner = [None; 128];
+    }
+}
+
+/// A tree read whole after `node`: with two or more compares, they stay in their halves and
+/// `node` exchanges its result instead.
+fn exchange_at(node: usize, leaves: Vec<usize>, insts: &[Decoded], plan: &mut Plan, live_out: &mut [Regs]) {
+    if leaves.len() < 2 {
+        return;
+    }
+    plan.sync.insert(insts[node].pc);
+    for l in leaves {
+        live_out[l] &= !uses(&insts[l]).1;
+    }
+}
+
+/// The split form's liveness (`whole_live_out_split`), then the mask trees of each basic block:
+/// a mask read whole can still skip the exchange where it is only combined first. When two or
+/// more compares or carries feed, in one basic block and nowhere else, a tree of lane-wise
+/// 64-bit bitwise ops (not `s_cmov` / `s_cselect`) whose result is read whole, the compares
+/// stay in their halves and the tree's last op exchanges its result once (before `scc` is
+/// derived from it). A block ends after every branch, conditional or not, and where any jump
+/// lands: ending one only at branch targets would let a compare read whole on the taken side
+/// of a conditional branch be made local by a tree on the fall-through side.
+pub fn analyze_split(insts: &[Decoded], end_reads_all: bool) -> Plan {
+    let (mut live_out, scc_out) = whole_live_out_mode(insts, end_reads_all, true);
+    let mut plan = Plan { whole_live: BTreeMap::new(), sync: BTreeSet::new() };
+    if insts.is_empty() {
+        return plan;
+    }
+    let table = use_plans();
+    let flows = flows_of(insts, true, |d| flow_with_table(d, table));
+    let pcs: BTreeMap<u64, usize> = insts.iter().enumerate().map(|(i, d)| (d.pc, i)).collect();
+    let succ = successors(insts, &pcs);
+    let live = live_out.clone();
+    // a block goes on only into an instruction it falls into and nothing else jumps to (every
+    // branch, conditional or not, ends one; `LOOP_GUARD` runs at block starts only)
+    let falls = |i: usize| succ[i].as_deref() == Some(&[i + 1][..]);
+    let mut joined = vec![false; insts.len()];
+    for (i, s) in succ.iter().enumerate() {
+        if !falls(i) {
+            for &j in s.iter().flatten() {
+                joined[j] = true;
+            }
+        }
+    }
+    let mut trees = Trees { owner: [None; 128], open: BTreeMap::new() };
+    for (i, d) in insts.iter().enumerate() {
+        if i > 0 && (!falls(i - 1) || joined[i]) {
+            trees.end_all(insts, &mut plan, &mut live_out);
+        }
+        let (read, written) = uses(d);
+        let name = d.inst.name;
+        // a compare whose mask is read whole starts a tree
+        if mask_producer(name) && written != 0 && written & EXEC == 0 && live[i] & written != 0 {
+            trees.end(read, true, insts, &mut plan, &mut live_out);
+            trees.end(written, false, insts, &mut plan, &mut live_out);
+            trees.bind(i, written, vec![i]);
+            continue;
+        }
+        let tree_op = flows[i].lane_op.filter(|_| !matches!(name, "S_CMOV_B64" | "S_CSELECT_B64"));
+        if let Some((dst, srcs, sets_scc)) = tree_op {
+            // sources that are whole trees whose value goes nowhere else after this op
+            let mut leaves = Vec::new();
+            for r in bits(srcs).filter(|r| r % 2 == 0) {
+                let pair = range(r as u64, 2);
+                let Some(node) = trees.owner[r] else { continue };
+                if trees.open[&node].0 == pair && live[i] & !dst & pair == 0 {
+                    for l in trees.take(node) {
+                        if !leaves.contains(&l) {
+                            leaves.push(l);
+                        }
+                    }
+                }
+            }
+            trees.end(read | flows[i].whole, true, insts, &mut plan, &mut live_out);
+            trees.end(dst, false, insts, &mut plan, &mut live_out);
+            if dst == 0 || dst & EXEC != 0 || (sets_scc && scc_out[i]) {
+                exchange_at(i, leaves, insts, &mut plan, &mut live_out);
+            } else if !leaves.is_empty() && live[i] & dst != 0 {
+                trees.bind(i, dst, leaves);
+            }
+            continue;
+        }
+        trees.end(read | flows[i].whole, true, insts, &mut plan, &mut live_out);
+        // a write of one word of a tree's pair leaves the other read whole
+        for r in bits(written) {
+            if let Some(node) = trees.owner[r] {
+                let whole = trees.open[&node].0 & !written != 0;
+                trees.end(range(r as u64, 1), whole, insts, &mut plan, &mut live_out);
+            }
+        }
+    }
+    trees.end_all(insts, &mut plan, &mut live_out);
+    plan.whole_live = insts.iter().map(|d| d.pc).zip(live_out).collect();
+    plan
 }
 
 #[cfg(test)]

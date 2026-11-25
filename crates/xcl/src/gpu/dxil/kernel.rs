@@ -546,6 +546,7 @@ impl Lw {
             gfx: None,
             gfx_half: None,
             whole_live: Default::default(),
+            x64_sync: Default::default(),
             guard_override: None,
             mask_override: None,
             local_masks: false,
@@ -592,7 +593,13 @@ impl Lw {
             lw.waves = t.div_ceil(64).max(1);
         }
         if split && std::env::var_os("XCL_X64_ALL_MASKS").is_none() {
-            lw.whole_live = crate::gpu::recomp::x64_masks::by_pc_split(insts, kernel);
+            let plan = crate::gpu::recomp::x64_masks::analyze_split(insts, kernel);
+            lw.whole_live = plan.whole_live;
+            lw.x64_sync = plan.sync;
+            // `sync_mask` exchanges its word and a word telling a partner that came from none
+            if !lw.x64_sync.is_empty() {
+                slot = slot.max(2);
+            }
         }
         lw.setup_storage(uses_lds, if split { slot } else { 1 });
         if let (Some(t), true) = (group_threads, split) {

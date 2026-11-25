@@ -82,6 +82,8 @@ pub fn plan(cfg: &Cfg, lw: &Lw) -> Option<Plan> {
                 let to = crate::gpu::rdna2::sgpr_uses(d).1.into_iter().chain([106, 126]).chain(sdwa);
                 key.extend(to.filter(|&r| r <= 126).map(|r| (l >> r) as u64 & 3));
             }
+            // a 64-bit op that exchanges its mask tree's result (`Lw::sync_mask`)
+            key.push(lw.x64_sync.contains(&d.pc) as u64);
             if d.inst.name == "S_GETPC_B64" {
                 key.push(d.pc);
             }
