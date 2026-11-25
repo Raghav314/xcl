@@ -823,10 +823,19 @@ struct ShadersOptions {
     threads: Option<usize>,
     trace: bool,
     max_bytes: usize,
-    timeout: u64,
+    /// `--timeout S`: `--direct` (default 10) and `--time-forms` (default 120)
+    timeout: Option<u64>,
     lanes: bool,
     hash: Option<u64>,
     dump: Option<PathBuf>,
+    time_forms: bool,
+    heap: bool,
+    no_hlsl: bool,
+    warm: bool,
+    all: Option<usize>,
+    max_hlsl_mb: usize,
+    max_dxil_kb: usize,
+    out: Option<PathBuf>,
 }
 
 fn parse_args(args: &[String]) -> Result<ShadersOptions, String> {
@@ -858,10 +867,18 @@ fn parse_args(args: &[String]) -> Result<ShadersOptions, String> {
         threads: None,
         trace: false,
         max_bytes: 16384,
-        timeout: 10,
+        timeout: None,
         lanes: false,
         hash: None,
         dump: None,
+        time_forms: false,
+        heap: false,
+        no_hlsl: false,
+        warm: false,
+        all: None,
+        max_hlsl_mb: 16,
+        max_dxil_kb: 4096,
+        out: None,
     };
     let mut p = crate::cli::Parser::new(args);
     while let Some(arg) = p.next_arg() {
@@ -896,10 +913,18 @@ fn parse_args(args: &[String]) -> Result<ShadersOptions, String> {
             "--threads" => opts.threads = Some(p.parse_usize("--threads")?),
             "--trace" => opts.trace = true,
             "--max-bytes" => opts.max_bytes = p.parse_usize("--max-bytes")?,
-            "--timeout" => opts.timeout = p.parse_u64("--timeout")?,
+            "--timeout" => opts.timeout = Some(p.parse_u64("--timeout")?),
             "--lanes" => opts.lanes = true,
             "--hash" => opts.hash = Some(p.parse_hex_u64("--hash")?),
             "--dump" => opts.dump = Some(PathBuf::from(p.value("--dump")?)),
+            "--time-forms" => opts.time_forms = true,
+            "--heap" => opts.heap = true,
+            "--no-hlsl" => opts.no_hlsl = true,
+            "--warm" => opts.warm = true,
+            "--all" => opts.all = Some(p.parse_usize("--all")?),
+            "--max-hlsl" => opts.max_hlsl_mb = p.parse_usize("--max-hlsl")?,
+            "--max-dxil" => opts.max_dxil_kb = p.parse_usize("--max-dxil")?,
+            "--out" => opts.out = Some(PathBuf::from(p.value("--out")?)),
             other => return Err(crate::cli::Parser::unexpected(other)),
         }
     }
@@ -983,8 +1008,8 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
         let windows = runtime_windows();
         return precompile(&input, opts.limit, windows, opts.split, opts.only.as_deref(), opts.pipelines, used.as_ref(), t0);
     }
-    if args.iter().any(|a| a == "--time-forms") {
-        return time_forms(&input, args, t0);
+    if opts.time_forms {
+        return time_forms(&input, &opts, t0);
     }
     if opts.direct {
         return direct_sweep(&input, &opts, t0);
@@ -2284,7 +2309,7 @@ fn direct_sweep(input: &Input, opts: &ShadersOptions, t0: std::time::Instant) ->
     // big programs translate slowly (SSA over every guarded access): skip above the cap,
     // give up on one after the timeout (its thread is left to finish; the process ends soon)
     let max_bytes = opts.max_bytes;
-    let timeout = std::time::Duration::from_secs(opts.timeout);
+    let timeout = std::time::Duration::from_secs(opts.timeout.unwrap_or(10));
     let skipped = AtomicUsize::new(0);
     // `--lanes`: compute programs through the per-lane form too (`recomp::lower_dxil`); where it
     // translates, its DXIL size against the per-instruction form's, and the refusals ranked
@@ -2439,25 +2464,24 @@ fn direct_sweep(input: &Input, opts: &ShadersOptions, t0: std::time::Instant) ->
 /// row includes the driver's warm-up.
 /// `--heap`: the two direct forms with heap windows instead of W. `--no-hlsl`: the HLSL
 /// columns stay empty. `--dump DIR`: each form's DXIL as `DIR/<idx>_<pl|pi|hl|hh>.dxil`.
-fn time_forms(input: &Input, args: &[String], t0: std::time::Instant) -> i32 {
+fn time_forms(input: &Input, opts: &ShadersOptions, t0: std::time::Instant) -> i32 {
     use std::time::{Duration, Instant};
     // driver compilers recurse deeply on big programs (a 2 MB stack overflowed under Wine)
     const BIG_STACK: usize = 256 << 20;
     use windows::Win32::Graphics::Direct3D12::*;
-    let opt = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).and_then(|v| v.parse::<u64>().ok());
-    let windows = opt("--windows").unwrap_or(4) as u32;
-    let split = opt("--split").map(|v| v != 0).unwrap_or(true);
-    let timeout = Duration::from_secs(opt("--timeout").unwrap_or(120));
-    let limit = opt("--limit").map(|v| v as usize).unwrap_or(usize::MAX);
-    let out_path = args.iter().position(|a| a == "--out").and_then(|i| args.get(i + 1)).cloned();
-    let threads = opt("--threads").map(|v| v.max(1) as usize).unwrap_or(8);
+    let windows = opts.windows;
+    let split = opts.split.unwrap_or(true);
+    let timeout = Duration::from_secs(opts.timeout.unwrap_or(120));
+    let limit = opts.limit;
+    let out_path = opts.out.clone();
+    let threads = opts.threads.unwrap_or(8).max(1);
     // `--all N`: a size-spread sample of N compute programs of every size (the 10 largest
     // always in), not only the ones the per-lane form takes (its columns are empty where it
     // refuses one)
-    let all = opt("--all").map(|v| v as usize);
-    let heap = args.iter().any(|a| a == "--heap");
-    let no_hlsl = args.iter().any(|a| a == "--no-hlsl");
-    let dump_dir = args.iter().position(|a| a == "--dump").and_then(|i| args.get(i + 1)).map(std::path::PathBuf::from);
+    let all = opts.all;
+    let heap = opts.heap;
+    let no_hlsl = opts.no_hlsl;
+    let dump_dir = opts.dump.clone();
     if let Some(d) = &dump_dir {
         let _ = std::fs::create_dir_all(d);
     }
@@ -2468,8 +2492,8 @@ fn time_forms(input: &Input, args: &[String], t0: std::time::Instant) -> i32 {
     };
     // caps for the giants: no DXC above `--max-hlsl` MB of HLSL, no driver build above
     // `--max-dxil` KB of DXIL (sizes are still recorded)
-    let max_hlsl = opt("--max-hlsl").unwrap_or(16) as usize * (1 << 20);
-    let max_dxil = opt("--max-dxil").unwrap_or(4096) as usize * 1024;
+    let max_hlsl = opts.max_hlsl_mb * (1 << 20);
+    let max_dxil = opts.max_dxil_kb * 1024;
     std::panic::set_hook(Box::new(|_| {}));
 
     // phase 1 (parallel): the compute programs and whether the per-lane form takes them
@@ -2550,7 +2574,7 @@ fn time_forms(input: &Input, args: &[String], t0: std::time::Instant) -> i32 {
         }
     };
     // cold driver builds: the driver's own shader cache off for this process (developer mode)
-    if args.iter().all(|a| a != "--warm") {
+    if !opts.warm {
         use windows::core::Interface;
         let r = pipelines.dev.cast::<ID3D12Device9>().and_then(|d9| unsafe {
             d9.ShaderCacheControl(D3D12_SHADER_CACHE_KIND_FLAG_IMPLICIT_DRIVER_MANAGED | D3D12_SHADER_CACHE_KIND_FLAG_IMPLICIT_D3D_CACHE_FOR_DRIVER | D3D12_SHADER_CACHE_KIND_FLAG_IMPLICIT_D3D_CONVERSIONS, D3D12_SHADER_CACHE_CONTROL_FLAG_DISABLE)
