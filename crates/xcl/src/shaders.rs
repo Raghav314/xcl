@@ -2553,7 +2553,7 @@ fn time_forms(input: &Input, args: &[String], t0: std::time::Instant) -> i32 {
     if args.iter().all(|a| a != "--warm") {
         use windows::core::Interface;
         let r = pipelines.dev.cast::<ID3D12Device9>().and_then(|d9| unsafe {
-            d9.ShaderCacheControl(D3D12_SHADER_CACHE_KIND_FLAG_IMPLICIT_DRIVER_MANAGED, D3D12_SHADER_CACHE_CONTROL_FLAG_DISABLE)
+            d9.ShaderCacheControl(D3D12_SHADER_CACHE_KIND_FLAG_IMPLICIT_DRIVER_MANAGED | D3D12_SHADER_CACHE_KIND_FLAG_IMPLICIT_D3D_CACHE_FOR_DRIVER | D3D12_SHADER_CACHE_KIND_FLAG_IMPLICIT_D3D_CONVERSIONS, D3D12_SHADER_CACHE_CONTROL_FLAG_DISABLE)
         });
         match r {
             Ok(()) => eprintln!("time-forms: the driver's shader cache is off for this process"),
