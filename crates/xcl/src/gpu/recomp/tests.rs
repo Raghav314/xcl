@@ -6933,6 +6933,56 @@ fn gpu_split_wave64_bitwise_lane_masks() {
     assert_eq!(r.sgpr[1], 77, "both halves must see SCC == 1 from upper-half match");
 }
 
+/// Split wave64 (`x64_masks::by_pc_split`): EXEC written by `v_cmpx` or `s_and_saveexec_b64` and
+/// read only lane by lane before it is restored stays in each half (no exchange); a `v_cmpx` whose
+/// EXEC `v_readfirstlane` reads is still exchanged, and both halves see the first active lane.
+#[test]
+fn gpu_split_wave64_predicated_exec_masks() {
+    if !gpu_ready() {
+        return;
+    }
+    let code = prog(&[
+        // v_cmpx region: lanes 0..49 add 100 to v4, then EXEC is restored
+        ("S_MOV_B64", "ENC_SOP1", &[("SDST", 10), ("SSRC0", 126)], None),
+        ("V_CMPX_LT_U32", "ENC_VOPC", &[("SRC0", V), ("VSRC1", 6)], None), // v6 = 50
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 4), ("SRC0", 255), ("VSRC1", 4)], Some(100)),
+        ("S_MOV_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 10)], None),
+        // s_and_saveexec_b64 region: lanes 20..63 add 50 to v5, then EXEC is restored
+        ("V_CMP_GE_U32", "ENC_VOP3", &[("VDST", 22), ("SRC0", V), ("SRC1", 148)], None),
+        ("S_AND_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 10), ("SSRC0", 22)], None),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 5), ("SRC0", 255), ("VSRC1", 5)], Some(50)),
+        ("S_MOV_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 10)], None),
+        // v_cmpx then v_readfirstlane: only lanes 41..63 active, both halves must read lane 41
+        ("S_MOV_B64", "ENC_SOP1", &[("SDST", 10), ("SSRC0", 126)], None),
+        ("V_CMPX_GT_U32", "ENC_VOP3", &[("SRC0", V), ("SRC1", 255)], Some(40)),
+        ("V_READFIRSTLANE_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", V)], None),
+        ("S_MOV_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 10)], None),
+        // the kernel runner reads every SGPR and SCC back: clear the local mask, overwrite SCC
+        ("S_MOV_B64", "ENC_SOP1", &[("SDST", 22), ("SSRC0", 128)], None),
+        ("S_CMP_EQ_U32", "ENC_SOPC", &[("SSRC0", 128), ("SSRC1", 128)], None),
+    ]);
+    if runner::split_wave64() {
+        let t = translate(&code, &runner::options(Mode::Kernel)).unwrap();
+        assert_eq!(t.hlsl.matches("= xcl_x_ballot_local(and(").count(), 2, "both predicated regions stay local\n{}", t.hlsl);
+        assert_eq!(t.hlsl.matches("= xcl_x_ballot(and(").count(), 1, "the v_cmpx read by v_readfirstlane is exchanged");
+    }
+    let mut st = KernelState::default();
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        let l = l as u32;
+        r[0] = l;
+        r[4] = 1000 + l;
+        r[5] = 2000 + l;
+        r[6] = 50;
+    }
+    let r = runner::run_code(&code, &st, &[]).unwrap();
+    assert_eq!(r.sgpr[2], 41, "v_readfirstlane after a v_cmpx that leaves only upper-half lanes");
+    for l in 0..64u32 {
+        let v = &r.vgpr[l as usize];
+        assert_eq!(v[4], 1000 + l + if l < 50 { 100 } else { 0 }, "lane {l}: v_cmpx region");
+        assert_eq!(v[5], 2000 + l + if l >= 20 { 50 } else { 0 }, "lane {l}: s_and_saveexec region");
+    }
+}
+
 /// Split-wave64 reduction-tail folding rules: 32-bit reduction tails, 64-bit `v_add_f64` tails,
 /// and direct `(L, L^32)` pairs fold into one `xcl_x_meet()`, while modifiers, mismatched lanes,
 /// `EXEC` writes, jump targets, and native wave64 stay untouched.

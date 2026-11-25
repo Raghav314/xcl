@@ -556,6 +556,9 @@ struct InstFlow {
     kill: Regs,
     /// Even-aligned 64-bit bitwise SALU op: `(dst, lane_srcs, sets_scc)`.
     lane_op: Option<(Regs, Regs, bool)>,
+    /// Split form only: even-aligned `s_*_saveexec_b64` / `s_*_wrexec_b64`:
+    /// `(dst, lane_src, is_wrexec)` (`save_exec_b64`).
+    save_exec: Option<(Regs, Regs, bool)>,
     reads_scc: bool,
     writes_scc: bool,
 }
@@ -565,10 +568,10 @@ fn flow_fallback(d: &Decoded) -> InstFlow {
     let r_scc = reads_scc_fallback(d);
     let w_scc = writes_scc_name(d.inst.name, d.enc.name);
     let Some(sets_scc) = lane_wise_salu64(d.inst.name) else {
-        return InstFlow { whole, kill, lane_op: None, reads_scc: r_scc, writes_scc: w_scc };
+        return InstFlow { whole, kill, lane_op: None, save_exec: None, reads_scc: r_scc, writes_scc: w_scc };
     };
     if d.variant != Variant::Plain {
-        return InstFlow { whole, kill, lane_op: None, reads_scc: r_scc, writes_scc: w_scc };
+        return InstFlow { whole, kill, lane_op: None, save_exec: None, reads_scc: r_scc, writes_scc: w_scc };
     }
     // Verify even SGPR pair alignment on dst and all register sources so low/high half words can
     // never cross-alias; scalar special codes `vccz` (251) / `execz` (252) always read whole.
@@ -589,7 +592,7 @@ fn flow_fallback(d: &Decoded) -> InstFlow {
                 continue;
             }
             if code > 126 || code & 1 != 0 || n != 2 {
-                return InstFlow { whole, kill, lane_op: None, reads_scc: r_scc, writes_scc: w_scc };
+                return InstFlow { whole, kill, lane_op: None, save_exec: None, reads_scc: r_scc, writes_scc: w_scc };
             }
             let r = range(code, 2);
             dst_regs |= r;
@@ -603,7 +606,7 @@ fn flow_fallback(d: &Decoded) -> InstFlow {
                 125 => {}
                 c if c <= 127 => {
                     if c > 126 || c & 1 != 0 || n != 2 {
-                        return InstFlow { whole, kill, lane_op: None, reads_scc: r_scc, writes_scc: w_scc };
+                        return InstFlow { whole, kill, lane_op: None, save_exec: None, reads_scc: r_scc, writes_scc: w_scc };
                     }
                     lane_srcs |= range(c, 2);
                 }
@@ -611,7 +614,7 @@ fn flow_fallback(d: &Decoded) -> InstFlow {
             }
         }
     }
-    InstFlow { whole: force_whole, kill, lane_op: Some((dst_regs, lane_srcs, sets_scc)), reads_scc: r_scc, writes_scc: w_scc }
+    InstFlow { whole: force_whole, kill, lane_op: Some((dst_regs, lane_srcs, sets_scc)), save_exec: None, reads_scc: r_scc, writes_scc: w_scc }
 }
 
 #[inline]
@@ -627,7 +630,7 @@ fn flow_with_table(d: &Decoded, table: &UsePlanTable) -> InstFlow {
         return InstFlow {
             whole: range(src, 124 - src) | M0 | EXEC,
             kill: 0,
-            lane_op: None,
+            lane_op: None, save_exec: None,
             reads_scc: plan.const_reads_scc || raw == 253,
             writes_scc: plan.writes_scc,
         };
@@ -638,7 +641,7 @@ fn flow_with_table(d: &Decoded, table: &UsePlanTable) -> InstFlow {
     let mut sdwa_dst = None;
     if d.variant == Variant::Sdwa {
         let Some(e) = ext_encoding(d) else {
-            return InstFlow { whole: ALL, kill: 0, lane_op: None, reads_scc: true, writes_scc: plan.writes_scc };
+            return InstFlow { whole: ALL, kill: 0, lane_op: None, save_exec: None, reads_scc: true, writes_scc: plan.writes_scc };
         };
         let fv = |n: &str| rdna2::field_value(e, &d.words, n).unwrap_or(0);
         if fv("S0") == 1 {
@@ -717,13 +720,83 @@ fn flow_with_table(d: &Decoded, table: &UsePlanTable) -> InstFlow {
         InstFlow {
             whole: force_whole,
             kill,
-            lane_op: Some((dst_regs, lane_srcs, plan.lane_wise == 2)),
+            lane_op: Some((dst_regs, lane_srcs, plan.lane_wise == 2)), save_exec: None,
             reads_scc: r_scc,
             writes_scc: plan.writes_scc,
         }
     } else {
-        InstFlow { whole, kill, lane_op: None, reads_scc: r_scc, writes_scc: plan.writes_scc }
+        InstFlow { whole, kill, lane_op: None, save_exec: None, reads_scc: r_scc, writes_scc: plan.writes_scc }
     }
+}
+
+/// `s_*_saveexec_b64` / `s_*_wrexec_b64` with even-aligned register operands:
+/// `((dst, lane_src, is_wrexec), read whole whatever is live)`. The new EXEC (and `scc`) is
+/// `op(src, EXEC)` lane by lane; `dst` gets the old EXEC, or the new one for `wrexec`.
+fn save_exec_b64(d: &Decoded) -> Option<((Regs, Regs, bool), Regs)> {
+    let name = d.inst.name;
+    let wrexec = name.contains("_WREXEC");
+    if d.variant != Variant::Plain || !name.ends_with("_B64") || !(wrexec || name.contains("_SAVEEXEC")) {
+        return None;
+    }
+    let dst = match rdna2::field_value(d.enc, &d.words, "SDST")? {
+        125 => 0,
+        v if v < 126 && v & 1 == 0 => range(v, 2),
+        _ => return None,
+    };
+    let (src, whole) = match rdna2::field_value(d.enc, &d.words, "SSRC0")? {
+        251 => (0, VCC),
+        252 => (0, EXEC),
+        125 => (0, 0),
+        v if v <= 126 && v & 1 == 0 => (range(v, 2), 0),
+        v if v <= 127 => return None,
+        _ => (0, 0),
+    };
+    Some(((dst, src, wrexec), whole))
+}
+
+/// The flows of a program. `exec_local` (split wave64): EXEC is a mask like the others, read
+/// whole only where the program reads it whole. Every VALU reads it lane by lane; DPP,
+/// `ds_swizzle` and `v_permlane(x)16` read it for a source lane in the reader's own half; the
+/// first active lane (`v_readfirstlane`) and the other half's lanes (`ds_(b)permute`) need the
+/// whole value, which the operand tables leave out.
+fn flows_of(insts: &[Decoded], exec_local: bool, flow: impl Fn(&Decoded) -> InstFlow) -> Vec<InstFlow> {
+    insts
+        .iter()
+        .map(|d| {
+            let mut f = flow(d);
+            if exec_local {
+                if let Some((se, forced)) = save_exec_b64(d) {
+                    f = InstFlow { whole: forced, kill: se.0 | EXEC, lane_op: None, save_exec: Some(se), reads_scc: f.reads_scc, writes_scc: f.writes_scc };
+                } else if matches!(d.inst.name, "V_READFIRSTLANE_B32" | "DS_BPERMUTE_B32" | "DS_PERMUTE_B32") {
+                    f.whole |= EXEC;
+                }
+            }
+            f
+        })
+        .collect()
+}
+
+/// What one instruction reads whole, given what is whole-live after it (`out`, `sout`).
+#[inline]
+fn gen_of(f: &InstFlow, out: Regs, sout: bool) -> Regs {
+    let mut gen = f.whole;
+    if let Some((dst, srcs, sets_scc)) = f.lane_op {
+        if (out & dst) != 0 || (sets_scc && sout) {
+            gen |= srcs;
+        }
+    }
+    if let Some((dst, src, wrexec)) = f.save_exec {
+        // the new EXEC (or `scc`, derived from it) read whole needs both inputs whole; the
+        // saved old EXEC read whole needs EXEC whole (the new one for `wrexec`)
+        let (exec_w, dst_w) = ((out & EXEC) != 0 || sout, (out & dst) != 0);
+        if exec_w || dst_w {
+            gen |= EXEC;
+        }
+        if exec_w || (wrexec && dst_w) {
+            gen |= src;
+        }
+    }
+    gen
 }
 
 /// (read whole, overwritten) SGPRs of one instruction. Lane-by-lane mask reads are left out
@@ -753,9 +826,10 @@ struct Block {
     has_exit: bool,
 }
 
-fn whole_live_out_unsorted(insts: &[Decoded], end_reads_all: bool, table: &UsePlanTable) -> Vec<Regs> {
+fn whole_live_out_unsorted(insts: &[Decoded], end_reads_all: bool, exec_local: bool, table: &UsePlanTable) -> Vec<Regs> {
     let pcs: BTreeMap<u64, usize> = insts.iter().enumerate().map(|(i, d)| (d.pc, i)).collect();
-    let at_end = if end_reads_all { ALL } else { EXEC };
+    let always = if exec_local { 0 } else { EXEC };
+    let at_end = if end_reads_all { ALL } else { always };
     let scc_at_end = end_reads_all;
     let succ: Vec<Option<Vec<usize>>> = insts
         .iter()
@@ -785,7 +859,7 @@ fn whole_live_out_unsorted(insts: &[Decoded], end_reads_all: bool, table: &UsePl
         .iter()
         .map(|d| loops.iter().filter(|&&(a, b)| a <= d.pc && d.pc < b).map(|&(_, b)| pcs.range(b..).next().map(|(_, &j)| j)).collect())
         .collect();
-    let flows: Vec<InstFlow> = insts.iter().map(|d| flow_with_table(d, table)).collect();
+    let flows: Vec<InstFlow> = flows_of(insts, exec_local, |d| flow_with_table(d, table));
     let mut live_in = vec![0 as Regs; insts.len()];
     let mut live_out = vec![0 as Regs; insts.len()];
     let mut scc_in = vec![false; insts.len()];
@@ -796,19 +870,14 @@ fn whole_live_out_unsorted(insts: &[Decoded], end_reads_all: bool, table: &UsePl
             let (out, sout) = match &succ[i] {
                 None => (ALL, true),
                 Some(s) if s.is_empty() => (at_end, scc_at_end),
-                Some(s) => s.iter().fold((EXEC, false), |(m, sc), &j| (m | live_in[j], sc || scc_in[j])),
+                Some(s) => s.iter().fold((always, false), |(m, sc), &j| (m | live_in[j], sc || scc_in[j])),
             };
             let (left, sleft) = exits[i].iter().fold((0 as Regs, false), |(m, sc), e| {
                 (m | at_end | e.map_or(0, |j| live_in[j]), sc || scc_at_end || e.is_some_and(|j| scc_in[j]))
             });
             let f = &flows[i];
-            let mut gen = f.whole;
-            if let Some((dst, srcs, sets_scc)) = f.lane_op {
-                if (out & dst) != 0 || (sets_scc && sout) {
-                    gen |= srcs;
-                }
-            }
-            let inn = gen | (out & !f.kill) | left | EXEC;
+            let gen = gen_of(f, out, sout);
+            let inn = gen | (out & !f.kill) | left | always;
             let sinn = f.reads_scc || (sout && !f.writes_scc) || sleft;
             if out != live_out[i] || inn != live_in[i] || sout != scc_out[i] || sinn != scc_in[i] {
                 live_out[i] = out;
@@ -884,16 +953,28 @@ fn nested_loop_ranges(mut raw: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
 /// For each instruction (index in `insts`): the SGPRs whose whole value may be read after it.
 /// `end_reads_all`: the program's end reads every SGPR (kernel mode).
 pub fn whole_live_out(insts: &[Decoded], end_reads_all: bool) -> Vec<Regs> {
+    whole_live_out_mode(insts, end_reads_all, false)
+}
+
+/// `whole_live_out` for the split wave64 form: EXEC is whole-live only where the program
+/// reads it whole (`flows_of`), so a `v_cmpx` / saveexec whose EXEC is only read lane by lane
+/// needs no exchange. Pixel shaders keep EXEC whole: they read the quad's other lanes' bits.
+pub fn whole_live_out_split(insts: &[Decoded], end_reads_all: bool) -> Vec<Regs> {
+    whole_live_out_mode(insts, end_reads_all, true)
+}
+
+fn whole_live_out_mode(insts: &[Decoded], end_reads_all: bool, exec_local: bool) -> Vec<Regs> {
     let n = insts.len();
     if n == 0 {
         return Vec::new();
     }
     let table = use_plans();
     if !insts.windows(2).all(|w| w[0].pc < w[1].pc) {
-        return whole_live_out_unsorted(insts, end_reads_all, table);
+        return whole_live_out_unsorted(insts, end_reads_all, exec_local, table);
     }
 
-    let at_end = if end_reads_all { ALL } else { EXEC };
+    let always = if exec_local { 0 } else { EXEC };
+    let at_end = if end_reads_all { ALL } else { always };
     let scc_at_end = end_reads_all;
     let lookup_pc = |pc: u64| insts.binary_search_by_key(&pc, |d| d.pc).ok();
     let first_ge = |pc: u64| {
@@ -959,7 +1040,7 @@ pub fn whole_live_out(insts: &[Decoded], end_reads_all: bool) -> Vec<Regs> {
     }
     let num_blocks = block_starts.len();
 
-    let flows: Vec<InstFlow> = insts.iter().map(|d| flow_with_table(d, table)).collect();
+    let flows: Vec<InstFlow> = flows_of(insts, exec_local, |d| flow_with_table(d, table));
 
     // Summarize each basic block: blocks without conditional `lane_op` instructions collapse
     // into O(1) `(gen, kill, scc_gen, scc_kill)` summaries; blocks with a `lane_op` evaluate
@@ -972,7 +1053,7 @@ pub fn whole_live_out(insts: &[Decoded], end_reads_all: bool) -> Vec<Regs> {
         let (mut bsgen, mut bskill) = (false, false);
         let mut has_lane_op = false;
         for f in flows[start..end].iter().rev() {
-            if f.lane_op.is_some() {
+            if f.lane_op.is_some() || f.save_exec.is_some() {
                 has_lane_op = true;
             }
             if !has_lane_op {
@@ -1074,9 +1155,9 @@ pub fn whole_live_out(insts: &[Decoded], end_reads_all: bool) -> Vec<Regs> {
             let (out, sout) = match blk.succ {
                 BlockSucc::Indirect => (ALL, true),
                 BlockSucc::Empty => (at_end, scc_at_end),
-                BlockSucc::One(s0) => (EXEC | block_in[s0 as usize], block_sin[s0 as usize]),
+                BlockSucc::One(s0) => (always | block_in[s0 as usize], block_sin[s0 as usize]),
                 BlockSucc::Two(s0, s1) => (
-                    EXEC | block_in[s0 as usize] | block_in[s1 as usize],
+                    always | block_in[s0 as usize] | block_in[s1 as usize],
                     block_sin[s0 as usize] || block_sin[s1 as usize],
                 ),
             };
@@ -1093,7 +1174,7 @@ pub fn whole_live_out(insts: &[Decoded], end_reads_all: bool) -> Vec<Regs> {
                 (0, false)
             };
             let (inn, sinn) = if !blk.has_lane_op {
-                (blk.gen | (out & !blk.kill) | left | EXEC, blk.scc_gen || (sout && !blk.scc_kill) || sleft)
+                (blk.gen | (out & !blk.kill) | left | always, blk.scc_gen || (sout && !blk.scc_kill) || sleft)
             } else if block_seen[b] && out == block_out[b] && sout == block_sout[b] && left == block_left[b] && sleft == block_sleft[b] {
                 (block_in[b], block_sin[b])
             } else {
@@ -1101,13 +1182,8 @@ pub fn whole_live_out(insts: &[Decoded], end_reads_all: bool) -> Vec<Regs> {
                 let end = if b + 1 < num_blocks { block_starts[b + 1] } else { n };
                 let (mut cur, mut scur) = (out, sout);
                 for f in flows[start..end].iter().rev() {
-                    let mut gen = f.whole;
-                    if let Some((dst, srcs, sets_scc)) = f.lane_op {
-                        if (cur & dst) != 0 || (sets_scc && scur) {
-                            gen |= srcs;
-                        }
-                    }
-                    cur = gen | (cur & !f.kill) | left | EXEC;
+                    let gen = gen_of(f, cur, scur);
+                    cur = gen | (cur & !f.kill) | left | always;
                     scur = f.reads_scc || (scur && !f.writes_scc) || sleft;
                 }
                 block_seen[b] = true;
@@ -1150,13 +1226,8 @@ pub fn whole_live_out(insts: &[Decoded], end_reads_all: bool) -> Vec<Regs> {
         for i in (start..end).rev() {
             live_out[i] = out;
             let f = &flows[i];
-            let mut gen = f.whole;
-            if let Some((dst, srcs, sets_scc)) = f.lane_op {
-                if (out & dst) != 0 || (sets_scc && sout) {
-                    gen |= srcs;
-                }
-            }
-            out = gen | (out & !f.kill) | left | EXEC;
+            let gen = gen_of(f, out, sout);
+            out = gen | (out & !f.kill) | left | always;
             sout = f.reads_scc || (sout && !f.writes_scc) || sleft;
         }
     }
@@ -1166,6 +1237,11 @@ pub fn whole_live_out(insts: &[Decoded], end_reads_all: bool) -> Vec<Regs> {
 /// pc → SGPRs whole-live after that instruction, for the emitter.
 pub fn by_pc(insts: &[Decoded], end_reads_all: bool) -> BTreeMap<u64, Regs> {
     insts.iter().map(|d| d.pc).zip(whole_live_out(insts, end_reads_all)).collect()
+}
+
+/// `by_pc` for the split wave64 form (`whole_live_out_split`).
+pub fn by_pc_split(insts: &[Decoded], end_reads_all: bool) -> BTreeMap<u64, Regs> {
+    insts.iter().map(|d| d.pc).zip(whole_live_out_split(insts, end_reads_all)).collect()
 }
 
 #[cfg(test)]
@@ -1271,6 +1347,67 @@ mod tests {
         assert!(whole_live_out(&p, false)[0] & EXEC == EXEC);
     }
 
+    #[test]
+    fn split_exec_is_exchanged_only_when_read_whole() {
+        let cmpx: I = ("V_CMPX_GT_U32", "ENC_VOPC", &[("SRC0", V), ("VSRC1", 1)]);
+        // v_cmpx; VALU; EXEC restored before s_cbranch_execz: the v_cmpx's EXEC is read lane by lane
+        let p = asm(&[
+            ("S_MOV_B64", "ENC_SOP1", &[("SDST", 10), ("SSRC0", 126)]),
+            cmpx,
+            ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 2), ("SRC0", V + 3), ("VSRC1", 4)]),
+            ("S_MOV_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 10)]),
+            CBRANCH_EXECZ,
+            ENDPGM,
+        ]);
+        let live = whole_live_out_split(&p, false);
+        assert!(!mask_needed(&live, 1, 126));
+        assert!(mask_needed(&live, 0, 10), "the saved EXEC is restored and then read whole");
+        // outside the split form EXEC stays whole-live
+        assert!(mask_needed(&whole_live_out(&p, false), 1, 126));
+        // the kernel runner reads EXEC at the end
+        let p = asm(&[cmpx, ENDPGM]);
+        assert!(!mask_needed(&whole_live_out_split(&p, false), 0, 126));
+        assert!(mask_needed(&whole_live_out_split(&p, true), 0, 126));
+        for reader in [
+            CBRANCH_EXECZ,
+            ("V_READFIRSTLANE_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", V)]),
+            ("DS_BPERMUTE_B32", "ENC_DS", &[("VDST", 2), ("ADDR", 0), ("DATA0", 1)]),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 252)]),
+            ("S_BCNT1_I32_B64", "ENC_SOP1", &[("SDST", 4), ("SSRC0", 126)]),
+        ] {
+            let p = asm(&[cmpx, reader, ENDPGM]);
+            assert!(mask_needed(&whole_live_out_split(&p, false), 0, 126), "{}", reader.0);
+        }
+    }
+
+    #[test]
+    fn split_saveexec_needs_whole_inputs_only_for_a_whole_read() {
+        let saveexec: I = ("S_AND_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 10), ("SSRC0", 20)]);
+        let restore: I = ("S_MOV_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 10)]);
+        let valu: I = ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 2), ("SRC0", V + 3), ("VSRC1", 4)]);
+        let bcnt_s10: I = ("S_BCNT1_I32_B64", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 10)]);
+        let w = |p: &[Decoded]| whole_live_out_split(p, false);
+        // predicated region, EXEC restored before it is read whole
+        let p = asm(&[CMP_S20, saveexec, valu, restore, CBRANCH_EXECZ, ENDPGM]);
+        assert!(!mask_needed(&w(&p), 0, 20));
+        assert!(mask_needed(&whole_live_out(&p, false), 0, 20), "outside the split form: as before");
+        // the new EXEC read whole (branch), or its `scc`
+        let p = asm(&[CMP_S20, saveexec, CBRANCH_EXECZ, valu, restore, ENDPGM]);
+        assert!(mask_needed(&w(&p), 0, 20));
+        let p = asm(&[CMP_S20, saveexec, ("S_CBRANCH_SCC0", "ENC_SOPP", &[("SIMM16", 0)]), restore, ENDPGM]);
+        assert!(mask_needed(&w(&p), 0, 20));
+        // the saved value read whole: the old EXEC for saveexec, the new one for wrexec
+        let p = asm(&[CMP_S20, saveexec, valu, bcnt_s10, ENDPGM]);
+        assert!(!mask_needed(&w(&p), 0, 20));
+        let p = asm(&[CMP_S20, ("S_ANDN2_WREXEC_B64", "ENC_SOP1", &[("SDST", 10), ("SSRC0", 20)]), valu, bcnt_s10, ENDPGM]);
+        assert!(mask_needed(&w(&p), 0, 20));
+        // an odd-aligned source pair is read whole
+        let p = asm(&[CMP_S20, ("S_AND_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 10), ("SSRC0", 21)]), valu, restore, ENDPGM]);
+        assert!(mask_needed(&w(&p), 0, 20));
+    }
+
+    const CBRANCH_EXECZ: I = ("S_CBRANCH_EXECZ", "ENC_SOPP", &[("SIMM16", 0)]);
+    const BCNT_EXEC: I = ("S_BCNT1_I32_B64", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 126)]);
     const CMP_S20: I = ("V_CMP_GT_U32", "ENC_VOP3", &[("VDST", 20), ("SRC0", V), ("SRC1", V + 1)]);
     const BCNT_S20: I = ("S_BCNT1_I32_B64", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 20)]);
     const BCNT_VCC: I = ("S_BCNT1_I32_B64", "ENC_SOP1", &[("SDST", 0), ("SSRC0", 106)]);
@@ -1428,9 +1565,10 @@ mod tests {
     }
 
     /// Reference instruction-level solver using `flow_fallback` verbatim.
-    fn whole_live_out_reference(insts: &[Decoded], end_reads_all: bool) -> Vec<Regs> {
+    fn whole_live_out_reference(insts: &[Decoded], end_reads_all: bool, exec_local: bool) -> Vec<Regs> {
         let pcs: BTreeMap<u64, usize> = insts.iter().enumerate().map(|(i, d)| (d.pc, i)).collect();
-        let at_end = if end_reads_all { ALL } else { EXEC };
+        let always = if exec_local { 0 } else { EXEC };
+        let at_end = if end_reads_all { ALL } else { always };
         let scc_at_end = end_reads_all;
         let succ: Vec<Option<Vec<usize>>> = insts
             .iter()
@@ -1460,7 +1598,7 @@ mod tests {
             .iter()
             .map(|d| loops.iter().filter(|&&(a, b)| a <= d.pc && d.pc < b).map(|&(_, b)| pcs.range(b..).next().map(|(_, &j)| j)).collect())
             .collect();
-        let flows: Vec<InstFlow> = insts.iter().map(flow_fallback).collect();
+        let flows: Vec<InstFlow> = flows_of(insts, exec_local, flow_fallback);
         let mut live_in = vec![0 as Regs; insts.len()];
         let mut live_out = vec![0 as Regs; insts.len()];
         let mut scc_in = vec![false; insts.len()];
@@ -1471,19 +1609,14 @@ mod tests {
                 let (out, sout) = match &succ[i] {
                     None => (ALL, true),
                     Some(s) if s.is_empty() => (at_end, scc_at_end),
-                    Some(s) => s.iter().fold((EXEC, false), |(m, sc), &j| (m | live_in[j], sc || scc_in[j])),
+                    Some(s) => s.iter().fold((always, false), |(m, sc), &j| (m | live_in[j], sc || scc_in[j])),
                 };
                 let (left, sleft) = exits[i].iter().fold((0 as Regs, false), |(m, sc), e| {
                     (m | at_end | e.map_or(0, |j| live_in[j]), sc || scc_at_end || e.is_some_and(|j| scc_in[j]))
                 });
                 let f = &flows[i];
-                let mut gen = f.whole;
-                if let Some((dst, srcs, sets_scc)) = f.lane_op {
-                    if (out & dst) != 0 || (sets_scc && sout) {
-                        gen |= srcs;
-                    }
-                }
-                let inn = gen | (out & !f.kill) | left | EXEC;
+                let gen = gen_of(f, out, sout);
+                let inn = gen | (out & !f.kill) | left | always;
                 let sinn = f.reads_scc || (sout && !f.writes_scc) || sleft;
                 if out != live_out[i] || inn != live_in[i] || sout != scc_out[i] || sinn != scc_in[i] {
                     live_out[i] = out;
@@ -1530,6 +1663,19 @@ mod tests {
                 for _ in 0..6 {
                     push(&mut bytes, CMP.0, CMP.1, CMP.2);
                     push(&mut bytes, CNDMASK.0, CNDMASK.1, CNDMASK.2);
+                }
+                // predicated region: saveexec, VALU, restore (EXEC read whole every 4th loop)
+                if k % 2 == 1 {
+                    push(&mut bytes, CMP_S20.0, CMP_S20.1, CMP_S20.2);
+                    push(&mut bytes, "S_AND_SAVEEXEC_B64", "ENC_SOP1", &[("SDST", 10), ("SSRC0", 20)]);
+                    push(&mut bytes, "V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 3), ("SRC0", V + 1), ("VSRC1", 2)]);
+                    if k % 4 == 3 {
+                        push(&mut bytes, BCNT_EXEC.0, BCNT_EXEC.1, BCNT_EXEC.2);
+                    }
+                    push(&mut bytes, "S_MOV_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 10)]);
+                    push(&mut bytes, "V_CMPX_GT_U32", "ENC_VOPC", &[("SRC0", V), ("VSRC1", 1)]);
+                    push(&mut bytes, "V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 3), ("SRC0", V + 1), ("VSRC1", 2)]);
+                    push(&mut bytes, "S_MOV_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 10)]);
                 }
                 if inner == 1 && k % 3 == 0 {
                     push(&mut bytes, MOV_S2_VCC.0, MOV_S2_VCC.1, MOV_S2_VCC.2);
@@ -1631,8 +1777,11 @@ mod tests {
             let p = synthetic_shader(outer);
             for end_reads_all in [false, true] {
                 let got = whole_live_out(&p, end_reads_all);
-                let want = whole_live_out_reference(&p, end_reads_all);
+                let want = whole_live_out_reference(&p, end_reads_all, false);
                 assert_eq!(got, want, "outer={outer}, end_reads_all={end_reads_all}");
+                let got = whole_live_out_split(&p, end_reads_all);
+                let want = whole_live_out_reference(&p, end_reads_all, true);
+                assert_eq!(got, want, "split: outer={outer}, end_reads_all={end_reads_all}");
             }
         }
         // Empty input
@@ -1649,10 +1798,10 @@ mod tests {
         let _ = use_plans();
         for &(outer, iters) in &[(8usize, 50usize), (40, 20), (80, 10)] {
             let p = synthetic_shader(outer);
-            assert_eq!(whole_live_out(&p, false), whole_live_out_reference(&p, false));
+            assert_eq!(whole_live_out(&p, false), whole_live_out_reference(&p, false, false));
             let t0 = Instant::now();
             for _ in 0..iters {
-                black_box(whole_live_out_reference(black_box(&p), false));
+                black_box(whole_live_out_reference(black_box(&p), false, false));
             }
             let ref_us = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
             let t1 = Instant::now();
